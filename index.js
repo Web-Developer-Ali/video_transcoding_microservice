@@ -2,7 +2,18 @@ const { QueueServiceClient } = require("@azure/storage-queue");
 const { BlobServiceClient } = require("@azure/storage-blob");
 const { ContainerInstanceManagementClient } = require("@azure/arm-containerinstance");
 const { DefaultAzureCredential } = require("@azure/identity");
+const winston = require("winston");
 require("dotenv").config();
+
+// Logging setup with production-grade configuration
+const logger = winston.createLogger({
+  level: process.env.NODE_ENV === "production" ? "warn" : "info", // Reduce logs in production
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.printf(({ timestamp, level, message }) => `${timestamp} [${level}]: ${message}`)
+  ),
+  transports: [new winston.transports.Console()],
+});
 
 // Validate required environment variables
 const requiredEnvVars = [
@@ -19,12 +30,12 @@ const requiredEnvVars = [
   "AZURE_STORAGE_ACCOUNT_KEY",
   "AZURE_REGISTRY_PASSWORD",
   "OUTPUT_CONTAINER_NAME",
-  "CONCURRENCY_LIMIT"
+  "CONCURRENCY_LIMIT",
 ];
 
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
-    console.error(`Missing required environment variable: ${envVar}`);
+    logger.error(`Missing required environment variable: ${envVar}`);
     process.exit(1);
   }
 }
@@ -51,7 +62,11 @@ async function checkContainerGroupExists() {
     await client.containerGroups.get(resourceGroupName, containerGroupName);
     return true;
   } catch (error) {
-    return error.statusCode === 404 ? false : (() => { throw error; })();
+    if (error.statusCode === 404) {
+      return false;
+    }
+    logger.error("Error checking container group existence:", error);
+    throw error;
   }
 }
 
@@ -62,7 +77,7 @@ async function getChapterIdFromBlob(blobName) {
     const properties = await blobClient.getProperties();
     return properties.metadata?.chapterid || null;
   } catch (error) {
-    console.error(`Error fetching metadata for blob ${blobName}:`, error.message);
+    logger.error(`Error fetching metadata for blob ${blobName}:`, error.message);
     return null;
   }
 }
@@ -73,9 +88,9 @@ async function deleteContainerGroupIfExists() {
     try {
       const deleteResult = await client.containerGroups.beginDelete(resourceGroupName, containerGroupName);
       await deleteResult.pollUntilDone();
-      console.log("Deleted existing container group:", containerGroupName);
+      logger.info("Deleted existing container group:", containerGroupName);
     } catch (error) {
-      console.error("Error deleting container group:", error.message);
+      logger.error("Error deleting container group:", error.message);
     }
   }
 }
@@ -132,9 +147,10 @@ async function createOrUpdateContainerGroup(messageContent, chapterId) {
   try {
     const result = await client.containerGroups.beginCreateOrUpdate(resourceGroupName, containerGroupName, containerGroup);
     await result.pollUntilDone();
-    console.log(`Container group ${containerGroupName} created successfully.`);
+    logger.info(`Container group ${containerGroupName} created successfully.`);
   } catch (error) {
-    console.error(`Error creating/updating container group:`, error.message);
+    logger.error(`Error creating/updating container group:`, error.message);
+    throw error;
   }
 }
 
@@ -143,13 +159,15 @@ async function startContainerWithRetry(messageContent, chapterId, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       await createOrUpdateContainerGroup(messageContent, chapterId);
-      console.log(`Container group ${containerGroupName} started.`);
+      logger.info(`Container group ${containerGroupName} started.`);
       return;
     } catch (error) {
       if (attempt === retries) {
-        console.error("Failed after multiple attempts:", error.message);
+        logger.error("Failed after multiple attempts:", error.message);
+        throw error;
       } else {
-        console.log(`Retrying start attempt ${attempt}...`);
+        logger.info(`Retrying start attempt ${attempt}...`);
+        await new Promise((resolve) => setTimeout(resolve, 5000)); // Wait before retrying
       }
     }
   }
@@ -160,9 +178,9 @@ async function stopContainer() {
   if (await checkContainerGroupExists()) {
     try {
       await client.containerGroups.stop(resourceGroupName, containerGroupName);
-      console.log(`Container group ${containerGroupName} stopped.`);
+      logger.info(`Container group ${containerGroupName} stopped.`);
     } catch (error) {
-      console.error("Error stopping container group:", error.message);
+      logger.error("Error stopping container group:", error.message);
     }
   }
 }
@@ -172,12 +190,12 @@ async function processMessages() {
   while (true) {
     try {
       await queueClient.createIfNotExists();
-      console.log(`Connected to queue: ${queueName}`);
+      logger.info(`Connected to queue: ${queueName}`);
 
       const response = await queueClient.receiveMessages({ numberOfMessages: 3, visibilityTimeout: 30 });
 
       if (!response.receivedMessageItems.length) {
-        console.log("No messages available.");
+        logger.info("No messages available. Waiting...");
         await new Promise((resolve) => setTimeout(resolve, 5000)); // Wait before polling again
         continue;
       }
@@ -186,7 +204,7 @@ async function processMessages() {
         response.receivedMessageItems.map(async (message) => {
           try {
             const decodedMessage = Buffer.from(message.messageText, "base64").toString("utf8");
-            console.log(`Received message: ${decodedMessage}`);
+            logger.info(`Received message: ${decodedMessage}`);
 
             const { data: { url } } = JSON.parse(decodedMessage);
             const blobName = url.split("/").pop();
@@ -195,22 +213,25 @@ async function processMessages() {
             if (chapterId) {
               await startContainerWithRetry(decodedMessage, chapterId);
             } else {
-              console.warn(`Skipping message due to missing chapterId.`);
+              logger.warn(`Skipping message due to missing chapterId.`);
             }
 
             await queueClient.deleteMessage(message.messageId, message.popReceipt);
-            console.log(`Message processed and deleted.`);
+            logger.info(`Message processed and deleted.`);
           } catch (error) {
-            console.error("Error processing message:", error.message);
+            logger.error("Error processing message:", error.message);
           }
         })
       );
     } catch (error) {
-      console.error("Error receiving messages:", error.message);
+      logger.error("Error receiving messages:", error.message);
       await new Promise((resolve) => setTimeout(resolve, 5000)); // Wait before retrying
     }
   }
 }
 
 // Start processing
-processMessages().catch(console.error);
+processMessages().catch((error) => {
+  logger.error("Unhandled error in processMessages:", error);
+  process.exit(1);
+});
