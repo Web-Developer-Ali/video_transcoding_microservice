@@ -1,0 +1,32 @@
+{
+  "name": "video_transcoding_microservice",
+  "version": "1.0.0",
+  "description": "A service for transcoding video files for better user experience.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "microservice",
+    "server",
+    "video-transcoding",
+    "adaptive-streaming",
+    "azure"
+  ],
+  "author": "Ali Hamza",
+  "license": "ISC",
+  "dependencies": {
+    "@azure/storage-blob": "^12.26.0",
+    "dotenv": "^16.4.7",
+    "fluent-ffmpeg": "^2.1.3",
+    "mime-types": "^2.1.35",
+    "mssql": "^11.0.1",
+    "p-limit": "^6.2.0",
+    "sanitize-filename": "^1.6.3",
+    "winston": "^3.17.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

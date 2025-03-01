@@ -1,0 +1,4 @@
+/node_modules
+/.env
+/gandu.js
+/container/.env
