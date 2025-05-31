@@ -1,4 +1,5 @@
-/node_modules
-/.env
+/Transcoding_Server/node_modules
+/Transcoding_Server/.env
+/Transcoding_Server/test.js
 /gandu.js
 /container/.env

@@ -1,387 +1,381 @@
-// Import necessary modules
-import { BlobServiceClient } from "@azure/storage-blob";
-import ffmpeg from "fluent-ffmpeg";
-import fs from "fs/promises";
-import path from "path";
-import os from "os";
-import pLimit from "p-limit";
-import sanitize from "sanitize-filename";
-import winston from "winston";
-import mime from "mime-types";
-import sql from "mssql";
+import { 
+  updateTranscodingStatus, 
+  shutdownDatabase, 
+  updateMasterPlaylistInDatabase, 
+  insertFileMetadata,
+  ensureDatabaseConnection
+} from './database.js';
+import { downloadBlob, uploadBlobs, deleteBlob } from './storage.js';
+import { transcodeVideoForAdaptiveStreaming, cleanupFiles, getVideoDuration } from './transcoder.js';
+import path from 'path';
+import sanitize from 'sanitize-filename';
+import winston from 'winston';
+import fs from 'fs/promises';
+import os from 'os';
+import express from 'express';
 
-// Logging setup
+// Health check server
+const app = express();
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'healthy',
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    disk: {
+      tmpdir: os.tmpdir(),
+      freemem: os.freemem() / (1024 * 1024) + 'MB'
+    }
+  });
+});
+const healthServer = app.listen(8080);
+
+// Configure structured logging
 const logger = winston.createLogger({
-  level: "info",
+  level: process.env.LOG_LEVEL || 'info',
   format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.printf(({ timestamp, level, message }) => `${timestamp} [${level}]: ${message}`)
+    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
   ),
-  transports: [new winston.transports.Console()],
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.printf(({ timestamp, level, message, stack }) => 
+        `${timestamp} [${level.toUpperCase()}]: ${message}${stack ? `\n${stack}` : ''}`)
+    })
+  ],
+  exitOnError: false
 });
 
-// Environment Variables
-const requiredEnvVars = [
-  "AZURE_STORAGE_CONNECTION_STRING",
-  "MESSAGE_CONTENT",
-  "AZURE_SQL_USER",
-  "AZURE_SQL_PASSWORD",
-  "AZURE_SQL_SERVER",
-  "AZURE_SQL_DATABASE",
-  "CONCURRENCY_LIMIT",
-  "INPUT_CONTAINER_NAME",
-  "OUTPUT_CONTAINER_NAME",
-  "chapterId",
-];
-requiredEnvVars.forEach((env) => {
-  if (!process.env[env]) throw new Error(`${env} is missing`);
-});
+// Constants
+const MAX_FILE_SIZE_MB = 200;
+const PROCESS_TIMEOUT_MS = 3600 * 1000; // 1 hour
+const MIN_DISK_SPACE_MB = 500;
 
-const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
-const tempDir = os.tmpdir(); // Cross-platform temporary directory
-const containerNameInput = process.env.INPUT_CONTAINER_NAME || "chaperters-videos-temp";
-const containerNameOutput = process.env.OUTPUT_CONTAINER_NAME || "chaperters-videos-transcoded";
-const concurrencyLimit = parseInt(process.env.CONCURRENCY_LIMIT) || 2;
+// Validate all required environment variables
+function validateEnvironment() {
+  const requiredEnvVars = [
+    'MESSAGE_CONTENT',
+    'chapterId',
+    'INPUT_CONTAINER_NAME',
+    'OUTPUT_CONTAINER_NAME',
+    'AZURE_STORAGE_CONNECTION_STRING',
+    'AZURE_STORAGE_ACCOUNT_NAME',
+    'NEON_POSTGRES_URL',
+    'CONCURRENCY_LIMIT'
+  ];
 
-// Database configuration
-const sqlConfig = {
-  user: process.env.AZURE_SQL_USER,
-  password: process.env.AZURE_SQL_PASSWORD,
-  server: process.env.AZURE_SQL_SERVER,
-  database: process.env.AZURE_SQL_DATABASE,
-  options: {
-    encrypt: true,
-    trustServerCertificate: true,
-  },
-};
-
-// Helper function for creating directories
-const ensureDirectoryExists = async (dirPath) => {
-  try {
-    await fs.mkdir(dirPath, { recursive: true });
-  } catch (error) {
-    logger.error(`Failed to ensure directory exists: ${dirPath}`, error);
+  const missingVars = requiredEnvVars.filter(env => !process.env[env]);
+  
+  if (missingVars.length > 0) {
+    const error = new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
+    error.code = 'ENV_VAR_MISSING';
     throw error;
   }
-};
+}
 
-// Reusable database connection function
-const withDatabaseConnection = async (callback) => {
-  let pool;
-  try {
-    pool = await sql.connect(sqlConfig);
-    return await callback(pool);
-  } catch (error) {
-    logger.error("Database connection error:", error);
-    throw new Error("Failed to connect to the database");
-  } finally {
-    if (pool) await pool.close();
+// Check system resources
+async function checkSystemResources() {
+  const stats = await fs.statfs(os.tmpdir());
+  const freeSpaceMB = (stats.bsize * stats.bfree) / (1024 * 1024);
+  
+  if (freeSpaceMB < MIN_DISK_SPACE_MB) {
+    throw new Error(`Insufficient disk space. Required: ${MIN_DISK_SPACE_MB}MB, Available: ${freeSpaceMB}MB`);
   }
-};
 
-// Update video field in database
-const updateVideoFieldInDatabase = async (chapterId, videoUrl) => {
-  return withDatabaseConnection(async () => {
-    const request = new sql.Request();
-    const query = `
-      UPDATE Courses_Chapters
-      SET Video = @videoUrl,
-          UpdatedAt = GETDATE()
-      WHERE ChapterID = @chapterId
-    `;
-    request.input('videoUrl', sql.NVarChar, videoUrl);
-    request.input('chapterId', sql.Int, parseInt(chapterId));
-    await request.query(query);
-    logger.info(`Video URL and status updated for ChapterID: ${chapterId}`);
-  });
-};
-
-// Update transcoding error in database
-const updateTranscodingError = async (chapterId, errorMessage) => {
-  return withDatabaseConnection(async () => {
-    const request = new sql.Request();
-    const query = `
-      UPDATE Courses_Chapters
-      SET TranscodingStatus = 'Failed',
-          TranscodingError = @errorMessage,
-          UpdatedAt = GETDATE()
-      WHERE ChapterID = @chapterId
-    `;
-    request.input('errorMessage', sql.NVarChar, errorMessage);
-    request.input('chapterId', sql.Int, parseInt(chapterId));
-    await request.query(query);
-    logger.info(`Error status updated for ChapterID: ${chapterId}`);
-  });
-};
-
-// Insert file metadata into ChapterFiles table
-const insertFileMetadata = async (chapterId, blobName, containerName) => {
-  return withDatabaseConnection(async () => {
-    const request = new sql.Request();
-    const query = `
-      INSERT INTO ChapterFiles (ChapterID, BlobName, ContainerName)
-      VALUES (@chapterId, @blobName, @containerName)
-    `;
-    request.input('chapterId', sql.Int, chapterId);
-    request.input('blobName', sql.NVarChar, blobName);
-    request.input('containerName', sql.NVarChar, containerName);
-    await request.query(query);
-    logger.info(`File metadata inserted for ChapterID: ${chapterId}, BlobName: ${blobName}`);
-  });
-};
-
-// Download blob from Azure Storage
-const downloadBlob = async (blobName, containerName) => {
-  const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
-  const containerClient = blobServiceClient.getContainerClient(containerName);
-  const blockBlobClient = containerClient.getBlockBlobClient(blobName);
-  const downloadPath = path.join(tempDir, blobName);
-
-  logger.info(`Downloading blob: ${blobName} from container: ${containerName}`);
-  try {
-    await blockBlobClient.downloadToFile(downloadPath);
-    logger.info(`Blob downloaded to: ${downloadPath}`);
-    return downloadPath;
-  } catch (error) {
-    logger.error(`Error downloading blob ${blobName}:`, error);
-    throw new Error(`Failed to download blob: ${blobName}`);
+  const memory = process.memoryUsage();
+  if (memory.rss > 800 * 1024 * 1024) { // 800MB
+    logger.warn('High memory usage detected', { memory });
   }
-};
+}
 
-// Transcode video for adaptive streaming
-const transcodeVideoForAdaptiveStreaming = async (inputPath, fileName) => {
-  const resolutions = {
-    "240p": "426x240",
-    "360p": "640x360",
-    "720p": "1280x720",
-    "1080p": "1920x1080",
-  };
-  const outputPaths = [];
-  const masterPlaylistPath = path.join(tempDir, `${fileName.split(".")[0]}_master.m3u8`);
-  const limit = pLimit(concurrencyLimit); // Configurable concurrency limit
+// Main processing function with comprehensive error handling
+async function processTask() {
+  let videoPath;
+  let outputFiles = [];
+  let chapterId;
+  let blobName;
+  let timeout;
 
-  logger.info("Starting video transcoding for adaptive streaming...");
   try {
-    const transcodePromises = Object.entries(resolutions).map(([resolution, size]) =>
-      limit(async () => {
-        const outputFolder = path.join(tempDir, resolution);
-        await ensureDirectoryExists(outputFolder);
+    // Phase 1: Initialization and validation
+    validateEnvironment();
+    await checkSystemResources();
+    await ensureDatabaseConnection();
+    
+    // Set processing timeout
+    timeout = setTimeout(() => {
+      throw new Error(`Processing timeout after ${PROCESS_TIMEOUT_MS/1000} seconds`);
+    }, PROCESS_TIMEOUT_MS);
 
-        const resolutionPlaylist = path.join(outputFolder, `${fileName.split(".")[0]}_${resolution}.m3u8`);
-        return new Promise((resolve, reject) => {
-          ffmpeg(inputPath)
-            .outputOptions([
-              `-vf scale=${size}`,
-              "-preset veryfast",
-              "-g 48",
-              "-sc_threshold 0",
-              "-hls_time 4", // 4-second segments
-              "-hls_playlist_type vod",
-              `-hls_segment_filename ${outputFolder}/${fileName.split(".")[0]}_${resolution}_%03d.ts`,
-            ])
-            .output(resolutionPlaylist)
-            .on("end", () => {
-              logger.info(`Transcoding for ${resolution} completed.`);
-              outputPaths.push(resolutionPlaylist);
-              resolve();
-            })
-            .on("error", (err) => {
-              logger.error(`Error transcoding to ${resolution}:`, err);
-              reject(new Error(`Failed to transcode to ${resolution}`));
-            })
-            .run();
-        });
-      })
-    );
+    chapterId = process.env.chapterId;
+    if (!chapterId || isNaN(chapterId)) {
+      throw new Error(`Invalid chapterId: ${chapterId}`);
+    }
 
-    await Promise.all(transcodePromises);
+    logger.info(`Starting adaptive streaming process for ChapterID: ${chapterId}`, { 
+      chapterId,
+      system: {
+        memory: process.memoryUsage(),
+        cpus: os.cpus().length,
+        freemem: os.freemem() / (1024 * 1024) + 'MB'
+      }
+    });
 
-    // Generate master playlist
-    const masterPlaylistContent = Object.keys(resolutions)
-      .map(
-        (res) =>
-          `#EXT-X-STREAM-INF:BANDWIDTH=${getBandwidth(res)},RESOLUTION=${resolutions[res]}\n${res}/${fileName.split(".")[0]}_${res}.m3u8`
-      )
-      .join("\n");
-    await fs.writeFile(masterPlaylistPath, masterPlaylistContent);
-    outputPaths.push(masterPlaylistPath);
+    // Phase 2: Message parsing
+    let message;
+    try {
+      const messageContent = Buffer.from(process.env.MESSAGE_CONTENT, "base64").toString("utf-8");
+      message = JSON.parse(messageContent);
+      
+      if (!message?.data?.url) {
+        throw new Error("Message missing 'data.url' property");
+      }
+      
+      blobName = sanitize(path.basename(message.data.url));
+      if (!blobName) {
+        throw new Error("Could not extract valid blob name from URL");
+      }
+    } catch (error) {
+      error.code = error.code || 'MESSAGE_PARSING_ERROR';
+      throw error;
+    }
 
-    logger.info("All resolutions transcoded successfully.");
-    return outputPaths;
-  } catch (error) {
-    logger.error("Error during transcoding:", error);
-    throw new Error("Failed to transcode video for adaptive streaming");
-  }
-};
+    logger.info(`Processing blob: ${blobName}`, { blobName });
 
-// Upload blobs to Azure Storage and insert metadata
-const uploadBlobs = async (filePaths, containerName, chapterId) => {
-  const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
-  const containerClient = blobServiceClient.getContainerClient(containerName);
-  let masterPlaylistUrl = '';
+    // Phase 3: Update status to Processing
+    await updateTranscodingStatus(chapterId, 'Processing');
 
-  logger.info(`Uploading files to container: ${containerName}`);
-  try {
-    for (const filePath of filePaths) {
-      const fileName = path.basename(filePath);
-      const timestamp = Date.now();
-      const uniqueBlobName = `${timestamp}_${fileName}`; // Unique blob name
-
-      const blockBlobClient = containerClient.getBlockBlobClient(uniqueBlobName);
-      const contentType = mime.lookup(fileName) || "application/octet-stream";
-
-      // Upload the file to Azure Storage
-      await blockBlobClient.uploadFile(filePath, {
-        blobHTTPHeaders: { blobContentType: contentType },
-      });
-
-      // Insert the file metadata into the database
-      await insertFileMetadata(chapterId, uniqueBlobName, containerName);
-
-      if (fileName.includes('_master.m3u8')) {
-        masterPlaylistUrl = blockBlobClient.url;
-        logger.info(`Master playlist URL: ${masterPlaylistUrl}`);
+    // Phase 4: Download original video with size validation
+    try {
+      videoPath = await downloadBlob(blobName, process.env.INPUT_CONTAINER_NAME);
+      const stats = await fs.stat(videoPath);
+      
+      if (stats.size === 0) {
+        throw new Error("Downloaded file is empty");
       }
 
-      logger.info(`Uploaded: ${uniqueBlobName} with Content-Type: ${contentType}`);
-    }
+      const fileSizeMB = stats.size / (1024 * 1024);
+      if (fileSizeMB > MAX_FILE_SIZE_MB) {
+        throw new Error(`File size ${fileSizeMB.toFixed(2)}MB exceeds maximum allowed ${MAX_FILE_SIZE_MB}MB`);
+      }
+      
+      logger.info(`Video downloaded successfully (${stats.size} bytes)`, { 
+        path: videoPath,
+        size: stats.size,
+        sizeMB: fileSizeMB.toFixed(2)
+      });
 
-    if (masterPlaylistUrl) {
-      await updateVideoFieldInDatabase(chapterId, masterPlaylistUrl);
-      logger.info(`Database updated with master playlist URL for chapter ${chapterId}`);
-    }
-
-    return masterPlaylistUrl;
-  } catch (error) {
-    logger.error(`Error uploading blobs:`, error);
-    throw new Error("Failed to upload blobs");
-  }
-};
-
-// Clean up temporary files
-const cleanupFiles = async (filePaths) => {
-  for (const filePath of filePaths) {
-    try {
-      await fs.unlink(filePath);
-      logger.info(`Deleted temporary file: ${filePath}`);
+      // Check video duration
+      const duration = await getVideoDuration(videoPath);
+      logger.info(`Video duration: ${duration} seconds`);
+      if (duration > 3600) { // 1 hour
+        logger.warn('Long video duration detected', { duration });
+      }
     } catch (error) {
-      logger.error(`Failed to delete file: ${filePath}`, error);
-    }
-  }
-};
-
-// Get bandwidth for a resolution
-const getBandwidth = (resolution) => {
-  const bandwidthMap = {
-    "240p": 800000,
-    "360p": 1500000,
-    "720p": 3000000,
-    "1080p": 6000000,
-  };
-  return bandwidthMap[resolution] || 1000000;
-};
-
-// Delete blob from Azure Storage
-const deleteBlob = async (blobName, containerName) => {
-  const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
-  const containerClient = blobServiceClient.getContainerClient(containerName);
-  const blockBlobClient = containerClient.getBlockBlobClient(blobName);
-
-  logger.info(`Deleting blob: ${blobName} from container: ${containerName}`);
-  try {
-    await blockBlobClient.delete();
-    logger.info(`Blob deleted: ${blobName}`);
-  } catch (error) {
-    logger.error(`Error deleting blob ${blobName}:`, error);
-    throw new Error(`Failed to delete blob: ${blobName}`);
-  }
-};
-
-// Process task
-const processTask = async () => {
-  try {
-    logger.info("Starting Adaptive Streaming Process...");
-
-    const messageContentBase64 = process.env.MESSAGE_CONTENT;
-    const messageContent = Buffer.from(messageContentBase64, "base64").toString("utf-8");
-    const message = JSON.parse(messageContent);
-    if (!message.subject) throw new Error("Invalid message content: subject is missing");
-
-    const blobName = sanitize(path.basename(message.subject));
-    const chapterId = process.env.chapterId;
-
-    // Set TranscodingStatus to 'Processing'
-    await withDatabaseConnection(async () => {
-      const request = new sql.Request();
-      const query = `
-        UPDATE Courses_Chapters
-        SET TranscodingStatus = 'Processing',
-            UpdatedAt = GETDATE()
-        WHERE ChapterID = @chapterId
-      `;
-      request.input('chapterId', sql.Int, parseInt(chapterId));
-      await request.query(query);
-      logger.info(`TranscodingStatus set to 'Processing' for ChapterID: ${chapterId}`);
-    });
-
-    const videoPath = await downloadBlob(blobName, containerNameInput);
-    logger.info(`Video downloaded to path: ${videoPath}`);
-
-    const outputFiles = await transcodeVideoForAdaptiveStreaming(videoPath, blobName);
-    logger.info("Transcoding completed for all resolutions.");
-
-    await uploadBlobs(outputFiles, containerNameOutput, chapterId);
-    logger.info("Files uploaded successfully.");
-
-    await cleanupFiles([videoPath, ...outputFiles]);
-    logger.info("Temporary files cleaned up.");
-
-    // Delete the original blob from the temporary container
-    await deleteBlob(blobName, containerNameInput);
-    logger.info(`Blob deleted from temporary container: ${blobName}`);
-
-    // Set TranscodingStatus to 'Completed'
-    await withDatabaseConnection(async () => {
-      const request = new sql.Request();
-      const query = `
-        UPDATE Courses_Chapters
-        SET TranscodingStatus = 'Completed',
-            UpdatedAt = GETDATE()
-        WHERE ChapterID = @chapterId
-      `;
-      request.input('chapterId', sql.Int, parseInt(chapterId));
-      await request.query(query);
-      logger.info(`TranscodingStatus set to 'Completed' for ChapterID: ${chapterId}`);
-    });
-
-    logger.info("Adaptive streaming process completed successfully.");
-  } catch (error) {
-    logger.error("Error during adaptive streaming process:", error);
-
-    // Set TranscodingStatus to 'Failed'
-    if (process.env.chapterId) {
-      await updateTranscodingError(process.env.chapterId, error.message);
+      error.code = error.code || 'DOWNLOAD_FAILED';
+      throw error;
     }
 
-    throw error; // Rethrow to ensure the process fails visibly
+    // Phase 5: Transcoding
+    try {
+      outputFiles = await transcodeVideoForAdaptiveStreaming(videoPath, blobName, chapterId);
+      logger.info(`Transcoding completed. Generated ${outputFiles.length} files`, {
+        fileCount: outputFiles.length,
+        files: outputFiles.map(f => path.basename(f))
+      });
+    } catch (error) {
+      error.code = error.code || 'TRANSCODING_FAILED';
+      throw error;
+    }
+
+    // Phase 6: Upload results
+    let uploadResult;
+    try {
+      uploadResult = await uploadBlobs(
+        outputFiles, 
+        process.env.OUTPUT_CONTAINER_NAME, 
+        chapterId,
+        process.env.SKIP_METADATA ? null : insertFileMetadata
+      );
+
+      if (!uploadResult?.masterPlaylistUrl) {
+        throw new Error('Master playlist URL not generated');
+      }
+
+      logger.info(`Upload completed. Master playlist URL: ${uploadResult.masterPlaylistUrl}`, {
+        masterPlaylistUrl: uploadResult.masterPlaylistUrl,
+        virtualFolder: uploadResult.virtualFolder
+      });
+    } catch (error) {
+      error.code = error.code || 'UPLOAD_FAILED';
+      throw error;
+    }
+
+    // Phase 7: Database updates
+    try {
+      // Store master playlist in Courses_Chapters table
+      await updateMasterPlaylistInDatabase(chapterId, uploadResult.masterPlaylistUrl);
+      
+      // Store all files in ChapterFiles table if metadata is enabled
+      if (!process.env.SKIP_METADATA) {
+        const filesToStore = outputFiles.map(file => ({
+          name: `${uploadResult.virtualFolder}${path.basename(file)}`,
+          container: process.env.OUTPUT_CONTAINER_NAME
+        }));
+        
+        await Promise.all(
+          filesToStore.map(file => 
+            insertFileMetadata(chapterId, file.name, file.container)
+              .catch(err => {
+                logger.warn(`Failed to record metadata for ${file.name}`, {
+                  error: err.message,
+                  chapterId,
+                  blobName: file.name
+                });
+              })
+          )
+        );
+      }
+      
+      logger.info(`Database updates completed for ChapterID: ${chapterId}`);
+    } catch (error) {
+      error.code = error.code || 'DATABASE_UPDATE_FAILED';
+      throw error;
+    }
+
+    // Phase 8: Cleanup
+    try {
+      const cleanupFilesList = [videoPath, ...outputFiles];
+      await cleanupFiles(cleanupFilesList);
+      
+      await deleteBlob(blobName, process.env.INPUT_CONTAINER_NAME)
+        .catch(err => logger.warn(`Input blob deletion warning: ${err.message}`));
+      
+      logger.info('Cleanup completed', { 
+        deletedFiles: cleanupFilesList.length 
+      });
+    } catch (error) {
+      logger.warn(`Cleanup warnings: ${error.message}`, { 
+        error: error.stack 
+      });
+    }
+
+    // Final status update
+    await updateTranscodingStatus(chapterId, 'Completed');
+    logger.info(`Processing completed successfully for ChapterID: ${chapterId}`, {
+      chapterId,
+      duration: process.uptime(),
+      memoryUsage: process.memoryUsage()
+    });
+
+  } catch (error) {
+    // Comprehensive error handling
+    logger.error(`Process failed: ${error.message}`, { 
+      error: {
+        message: error.message,
+        stack: error.stack,
+        code: error.code || 'UNKNOWN_ERROR'
+      },
+      chapterId,
+      blobName,
+      system: {
+        memory: process.memoryUsage(),
+        loadavg: os.loadavg()
+      }
+    });
+    
+    // Update status to Failed if we have a chapterId
+    if (chapterId) {
+      await updateTranscodingStatus(chapterId, 'Failed', error.message)
+        .catch(dbError => 
+          logger.error('Failed to update transcoding status', {
+            originalError: error.message,
+            dbError: dbError.message
+          })
+        );
+    }
+
+    // Attempt cleanup on failure
+    try {
+      if (videoPath) await fs.unlink(videoPath).catch(() => {});
+      if (outputFiles.length > 0) await cleanupFiles(outputFiles).catch(() => {});
+    } catch (cleanupError) {
+      logger.warn('Cleanup during failure encountered errors', {
+        error: cleanupError.message
+      });
+    }
+
+    throw error;
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
-};
+}
 
-// Graceful shutdown
-const handleShutdown = async () => {
-  logger.info("Shutting down gracefully...");
-  process.exit(0);
-};
+// Graceful shutdown handler
+async function handleShutdown(signal) {
+  logger.info(`Received ${signal}, shutting down gracefully...`, { 
+    signal,
+    uptime: process.uptime()
+  });
+  try {
+    // Close health check server first
+    await new Promise(resolve => healthServer.close(resolve));
+    
+    // Then shutdown database
+    await shutdownDatabase();
+    logger.info('Shutdown completed successfully');
+    process.exit(0);
+  } catch (error) {
+    logger.error('Error during shutdown:', { 
+      error: {
+        message: error.message,
+        stack: error.stack
+      }
+    });
+    process.exit(1);
+  }
+}
 
-process.on("SIGTERM", handleShutdown);
-process.on("SIGINT", handleShutdown);
+// Process lifecycle management
+process.on("SIGTERM", () => handleShutdown('SIGTERM'));
+process.on("SIGINT", () => handleShutdown('SIGINT'));
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error('Unhandled Rejection at:', { 
+    promise, 
+    reason: reason instanceof Error ? reason.stack : reason 
+  });
+});
+process.on("uncaughtException", error => {
+  logger.error('Uncaught Exception:', { error: error.stack });
+  handleShutdown('UNCAUGHT_EXCEPTION');
+});
 
-// Start the processing task
+// Resource monitoring
+setInterval(() => {
+  logger.debug('Resource snapshot', {
+    memory: process.memoryUsage(),
+    cpu: os.loadavg(),
+    disk: {
+      tmpdir: os.tmpdir(),
+      freemem: os.freemem() / (1024 * 1024) + 'MB'
+    }
+  });
+}, 60000); // Every minute
+
+// Entry point
 processTask()
-  .then(() => {
-    logger.info("Processing task script reached its end. Exiting gracefully.");
-  })
-  .catch((error) => {
-    logger.error("Unhandled error in processing task:", error);
+  .then(() => process.exit(0))
+  .catch(error => {
+    logger.error('Fatal error during process execution', { 
+      error: {
+        message: error.message,
+        stack: error.stack,
+        code: error.code || 'FATAL_ERROR'
+      },
+      system: {
+        memory: process.memoryUsage(),
+        uptime: process.uptime()
+      }
+    });
     process.exit(1);
   });
