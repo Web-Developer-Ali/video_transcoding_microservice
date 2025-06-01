@@ -1,27 +1,31 @@
 {
   "name": "video_transcoding_microservice",
   "version": "1.0.0",
-  "description": "A serveice for transcoding video files fro better user experience.",
+  "description": "A service for transcoding video files for better user experience.",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "dev": "index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "keywords": [
     "microservice",
-    "server"
+    "server",
+    "video",
+    "transcoding"
   ],
-  "author": "Ali hamza",
+  "author": "Ali Hamza",
   "license": "ISC",
   "dependencies": {
     "@azure/arm-containerinstance": "^9.1.0",
     "@azure/identity": "^4.5.0",
-    "@azure/ms-rest-nodeauth": "^3.1.1",
     "@azure/storage-blob": "^12.26.0",
     "@azure/storage-queue": "^12.25.0",
-    "@grpc/proto-loader": "^0.7.13",
     "dotenv": "^16.4.7",
     "pg": "^8.16.0",
     "winston": "^3.17.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
